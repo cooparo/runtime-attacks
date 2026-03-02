@@ -14,19 +14,33 @@ This repo uses a Nix flake to provide a reproducible dev shell.
 curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
 ```
 
+### Speed up the building time (needed only once)
+Go into `/etc/nix/nix.conf` and add the following lines:
+```nix
+experimental-features = nix-command flakes
+trusted-users = root <your-username>
+```
+
 ### Enter the shell
 
 ```sh
-nix develop --command zsh
+nix develop --command $SHELL
 ```
+
+Press `y` when prompted with questions about whether would you like to add the cachix pwngdb to trusted, otherwise your nix development environment it is going to build from source code the `pwngdb` tool (dead slow). Instead, we are going to take advantage of the cache of pwngdb itself, to directly download the binary.
 
 This drops you into a shell with all tools and packages listed in the `flake.nix` available. Exit with `Ctrl+D` or `exit`.
 
 ### With `direnv` (optional but recommended)
 
-If you have [`direnv`](https://direnv.net/) installed, the shell activates automatically when you `cd` into the repo:
+If you have [`direnv`](https://direnv.net/) installed, the **shell activates automatically when you `cd` into the repo**:
 
 Give direnv permissions:
 ```sh
 direnv allow
+```
+
+If you want to remove these permissions:
+```sh
+direnv disallow
 ```
