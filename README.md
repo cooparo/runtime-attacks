@@ -8,10 +8,9 @@ AAU project on runtime software attacks — research, PoC, detection, and evalua
 
 This repo uses a Nix flake to provide a reproducible dev shell.
 
-**Prerequisites:** Nix with flakes enabled. If you don't have Nix, install it via [the Determinate installer](https://determinate.systems/posts/determinate-nix-installer/):
-
+**Prerequisites:** Nix with flakes enabled. If you don't have Nix, install it via [nixos.org](https://nixos.org/download/):
 ```sh
-curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install) --daemon
 ```
 
 ### Speed up the building time (needed only once)
