@@ -12,6 +12,10 @@
 # PDF with project instruction
 !project_instructions.pdf
 
+# Report submodule
+!report
+!report/**
+
 !README.md
 !LICENSE
 !Makefile
