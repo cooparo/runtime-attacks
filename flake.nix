@@ -28,8 +28,21 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.gdb
+              pkgs.pwntools
+
               pwndbg.packages.${system}.pwndbg
             ];
+
+            # Disable all Nix CC wrapper hardening flags
+            hardeningDisable = [ "all" ];
+
+            # Explicitly disable all security features for vulnerable binaries.
+            # hardeningDisable only stops Nix from *adding* flags; these counter
+            # GCC/ld built-in defaults so `checksec` shows everything disabled.
+            shellHook = ''
+              export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -fno-stack-protector -fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-pie"
+              export NIX_LDFLAGS="''${NIX_LDFLAGS:-} --no-pie -z execstack -z norelro"
+            '';
           };
         };
     };
