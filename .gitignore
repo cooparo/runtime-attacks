@@ -20,10 +20,23 @@
 !LICENSE
 !Makefile
 
-# Nix 
+# Nix
 !*.nix
 !flake.lock
 !.envrc
+
+# Source code
+!*.c
+!*.h
+!*.py
+!*.json
+!*.dot
+!*.md
+
+# Don't track build outputs / Python caches
+__pycache__/
+*.o
+*.pyc
 
 # ...even if they are in subdirectories
 !*/

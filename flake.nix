@@ -28,7 +28,15 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.gdb
-              pkgs.pwntools
+
+              # Unified Python env: pwntools (exploit dev), capstone (disassembly),
+              # pyelftools (ELF parsing), ropgadget (gadget search for iter 2).
+              (pkgs.python3.withPackages (ps: with ps; [
+                pwntools
+                capstone
+                pyelftools
+                ropgadget
+              ]))
 
               pwndbg.packages.${system}.pwndbg
             ];
