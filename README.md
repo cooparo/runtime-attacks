@@ -54,3 +54,41 @@ If you want to remove these permissions:
 ```sh
 direnv disallow
 ```
+
+## Building and running the tests
+
+The repo has a top-level `Makefile` that delegates to each component
+(`detector/`, every `attacks/*/`). The test harness exercises every
+attack against the current detector and reports pass/fail per case.
+
+```sh
+nix develop -c make          # build detector + every attack
+nix develop -c make test     # build (if needed) and run the matrix
+nix develop -c make clean    # clean every component
+```
+
+Expected `make test` output:
+```
+[ ok ] 01-stack-bof :: benign           (   80ms)  exit=0
+[ ok ] 01-stack-bof :: attack           (  950ms)  exit=2
+
+2 passed, 0 failed
+```
+Shell exit code is 0 on success, 1 if any case fails.
+
+### Adding a new attack to the test matrix
+
+1. Create `attacks/NN-name/` with `victim.c`, `exploit.py`, `Makefile`
+   (mirror the layout of `attacks/01-stack-bof/`).
+2. Append two entries (one `benign`, one `attack`) to the `TESTS` list
+   in `tools/run_tests.py`.
+3. `make test` will build the new attack and run it against the
+   detector automatically.
+
+### Useful flags
+
+```sh
+python3 tools/run_tests.py -v               # dump tracer stderr on every case
+python3 tools/run_tests.py -k 01-stack-bof  # only run cases matching substring
+```
+
