@@ -55,6 +55,29 @@ If you want to remove these permissions:
 direnv disallow
 ```
 
+## Get started
+
+Inside the dev shell, build everything and run the tracer manually
+against an attack:
+
+```sh
+make build
+
+# benign run: payload is a clean line of text
+echo "hello" | ./detector/tracer attacks/01-stack-bof/victim
+
+# attack run: payload is the exploit's stdout
+python3 attacks/01-stack-bof/exploit.py | ./detector/tracer attacks/01-stack-bof/victim
+```
+
+The tracer takes the victim path as argv and reads the victim's stdin
+from the pipe. Exit codes: `0` clean, `1` tracer error, `2` attack
+detected. On detection it prints
+`[!!! ATTACK DETECTED] ret at 0x... expected 0x... got 0x...` to stderr.
+
+If you are not already in the dev shell, prefix each command with
+`nix develop -c` (e.g. `nix develop -c make build`).
+
 ## Building and running the tests
 
 The repo has a top-level `Makefile` that delegates to each component
