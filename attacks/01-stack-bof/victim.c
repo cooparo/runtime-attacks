@@ -10,27 +10,25 @@
  * win() is the redirect target used to confirm successful exploitation.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 void win(void) {
-    write(1, "[!] PWNED -- control flow hijacked\n", 35);
-    _exit(42);
+  write(1, "[!] PWNED -- control flow hijacked\n", 35);
+  _exit(42);
 }
 
 void vuln(void) {
-    char buffer[64];
-    write(1, "[victim] enter input: ", 22);
-    read(0, buffer, 256);
-    write(1, "[victim] you entered: ", 22);
-    write(1, buffer, 64);
-    write(1, "\n", 1);
+  char buffer[64];
+  write(1, "[victim] enter input: ", 22);
+  read(0, buffer, 256);
+  write(1, "[victim] you entered: ", 22);
+  write(1, buffer, 64);
+  write(1, "\n", 1);
 }
 
 int main(void) {
-    write(1, "[victim] start\n", 15);
-    vuln();
-    write(1, "[victim] normal exit\n", 21);
-    return 0;
+  write(1, "[victim] start\n", 15);
+  vuln();
+  write(1, "[victim] normal exit\n", 21);
+  return 0;
 }
