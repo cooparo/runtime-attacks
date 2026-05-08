@@ -85,9 +85,16 @@ The repo has a top-level `Makefile` that delegates to each component
 attack against the current detector and reports pass/fail per case.
 
 ```sh
-nix develop -c make          # build detector + every attack
-nix develop -c make test     # build (if needed) and run the matrix
-nix develop -c make clean    # clean every component
+# enter the nix shell, if you are not already into
+# to check if you are in a nix shell run 
+# echo $IN_NIX_SHELL
+# if retrieves non-empty string, then you are in a nix shell
+# otherwise run
+# nix develop -c $SHELL
+
+make          # build detector + every attack
+make test     # build (if needed) and run the matrix
+make clean    # clean every component
 ```
 
 Expected `make test` output:
