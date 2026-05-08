@@ -4,6 +4,16 @@
 
 AAU project on runtime software attacks — research, PoC, detection, and evaluation.
 
+## Roadmap
+
+What attacks are we able to detect:
+- [x] Buffer overflows/Code injection
+- [ ] Return Oriented Programming
+    - [ ] Jump Oriented Programming
+    - [ ] Function reuse
+- [ ] Data-only attacks
+- [ ] Non-control Data overflows
+
 ## Development Environment (optional but recommended)
 
 This repo uses a Nix flake to provide a reproducible dev shell.
