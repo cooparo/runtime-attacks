@@ -30,6 +30,11 @@ experimental-features = nix-command flakes
 trusted-users = root <your-username>
 ```
 
+After you edited the files, restart the nix daemon:
+```
+sudo systemctl restart nix-daemon
+```
+
 ### Enter the shell
 
 ```sh
@@ -39,6 +44,12 @@ nix develop --command $SHELL
 Press `y` when prompted with questions about whether would you like to add the cachix pwngdb to trusted, otherwise your nix development environment it is going to build from source code the `pwngdb` tool (dead slow). Instead, we are going to take advantage of the cache of pwngdb itself, to directly download the binary.
 
 This drops you into a shell with all tools and packages listed in the `flake.nix` available. Exit with `Ctrl+D` or `exit`.
+
+To know if you are correctly entered in the nix shell, run:
+```sh
+echo $IN_NIX_SHELL
+```
+you should get: `impure` (not sure, every not empty result is fine).
 
 ### Hardening disabled by default
 
