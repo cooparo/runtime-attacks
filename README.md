@@ -4,11 +4,27 @@
 
 AAU project on runtime software attacks — research, PoC, detection, and evaluation.
 
+## What the detector does
+
+The detector (`detector/tracer`) is a **user-space shadow call stack** built on the Linux `ptrace` API. It enforces call/return discipline at runtime: every `ret` must return to the address recorded by its matching `bl`/`blr`. Any deviation is flagged as an attack.
+
+Flow per traced process:
+
+1. **Fork + `PTRACE_TRACEME`** — child execs the victim, parent becomes the tracer.
+2. **One-shot `BRK` at `main`** — `PTRACE_CONT` past `ld.so` and `__libc_start_main` (single-stepping them is prohibitively slow on a Pi). When the BRK fires, the original instruction is restored and the legitimate return-into-libc address is pre-pushed to the shadow stack.
+3. **Single-step loop from `main`** — peek the next AArch64 instruction at the current PC and decode:
+    - `bl imm` / `blr Xn` → push `pre_pc + 4` (the return site) to the shadow stack
+    - `ret` → pop the expected target and compare against the actual post-step PC
+    - mismatch → `[!!! ATTACK DETECTED]` to stderr, `PTRACE_KILL` the tracee, exit with code `2`
+4. **Clean detach** — when main returns and the shadow stack drains, detach and let glibc cleanup run unobserved.
+
+Because the check is structural (every ret matches a recorded call), the detector catches any control-flow hijack that subverts the call/return contract — including direct ret overwrite (stack buffer overflow) and full ROP chains — without per-attack signatures or a CFG model. It does **not** yet validate indirect-call (`blr`) targets or direct branches (`b`/`b.cond`); those are out of scope for the call/return shadow stack and require a CFG-edge model (planned for a later iteration).
+
 ## Roadmap
 
 What attacks are we able to detect:
-- [x] Buffer overflows/Code injection
-- [ ] Return Oriented Programming
+- [x] Buffer overflows/Code injection — `attacks/01-stack-bof/`
+- [x] Return Oriented Programming — `attacks/02-rop/` (3-gadget chain, detected at first hijacked `ret`)
     - [ ] Jump Oriented Programming
     - [ ] Function reuse
 - [ ] Data-only attacks
@@ -120,10 +136,12 @@ make clean    # clean every component
 
 Expected `make test` output:
 ```
-[ ok ] 01-stack-bof :: benign           (   80ms)  exit=0
-[ ok ] 01-stack-bof :: attack           (  950ms)  exit=2
+[ ok ] 01-stack-bof :: benign            (    63ms)  exit=0
+[ ok ] 01-stack-bof :: attack            (   908ms)  exit=2
+[ ok ] 02-rop :: benign                  (    82ms)  exit=0
+[ ok ] 02-rop :: attack                  (  1084ms)  exit=2
 
-2 passed, 0 failed
+4 passed, 0 failed
 ```
 Shell exit code is 0 on success, 1 if any case fails.
 

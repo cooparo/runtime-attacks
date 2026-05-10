@@ -51,6 +51,22 @@ TESTS: list[dict] = [
         "must_contain": ["[!!! ATTACK DETECTED]"],
         "must_not_contain": [],
     },
+    {
+        "name": "02-rop :: benign",
+        "victim": "attacks/02-rop/victim",
+        "input_cmd": ["echo", "hello"],
+        "expected_exit": 0,
+        "must_contain": [],
+        "must_not_contain": ["[!!! ATTACK DETECTED]"],
+    },
+    {
+        "name": "02-rop :: attack",
+        "victim": "attacks/02-rop/victim",
+        "input_cmd": ["python3", "attacks/02-rop/exploit.py"],
+        "expected_exit": 2,
+        "must_contain": ["[!!! ATTACK DETECTED]"],
+        "must_not_contain": [],
+    },
 ]
 
 
