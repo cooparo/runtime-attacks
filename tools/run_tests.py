@@ -28,12 +28,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TRACER    = REPO_ROOT / "detector" / "tracer"
 
 # Each case:
-#   name              human-readable identifier
-#   victim            path to victim binary, relative to REPO_ROOT
-#   input_cmd         argv list run to produce payload bytes on stdout
-#   expected_exit     required tracer exit code
-#   must_contain      substrings that MUST appear in tracer stderr
-#   must_not_contain  substrings that MUST NOT appear in tracer stderr
+#   name                  human-readable identifier
+#   victim                path to victim binary, relative to REPO_ROOT
+#   input_cmd             argv list run to produce payload bytes on stdout
+#   expected_exit         required tracer exit code
+#   must_contain          substrings that MUST appear in tracer stderr
+#   must_not_contain      substrings that MUST NOT appear in tracer stderr
+#   must_contain_stdout   (optional) substrings that MUST appear in tracer stdout
+#                         — used by gap-demo cases where the attack succeeds and
+#                         the marker shows up on the tracee's stdout
 TESTS: list[dict] = [
     {
         "name": "01-stack-bof :: benign",
@@ -66,6 +69,28 @@ TESTS: list[dict] = [
         "expected_exit": 2,
         "must_contain": ["[!!! ATTACK DETECTED]"],
         "must_not_contain": [],
+    },
+    {
+        "name": "03-jop :: benign",
+        "victim": "attacks/03-jop/victim",
+        "input_cmd": ["echo", "hello"],
+        "expected_exit": 0,
+        "must_contain": [],
+        "must_not_contain": ["[!!! ATTACK DETECTED]"],
+    },
+    # NOTE: green = attack SUCCEEDED. This case documents the JOP gap in
+    # the iter-1 shadow stack — the detector cannot catch indirect-branch
+    # hijacks that terminate in _exit(). When iter-3b adds CFG-edge
+    # validation, flip expected_exit to 2 and replace must_contain_stdout
+    # with must_contain on stderr.
+    {
+        "name": "03-jop :: attack (gap demo)",
+        "victim": "attacks/03-jop/victim",
+        "input_cmd": ["python3", "attacks/03-jop/exploit.py"],
+        "expected_exit": 0,
+        "must_contain": [],
+        "must_contain_stdout": ["[!] PWNED via JOP chain"],
+        "must_not_contain": ["[!!! ATTACK DETECTED]"],
     },
 ]
 
@@ -103,6 +128,7 @@ def run_case(case: dict) -> tuple[bool, str, float, str]:
 
     dt = time.monotonic() - t0
     stderr = proc.stderr.decode(errors="replace")
+    stdout = proc.stdout.decode(errors="replace")
 
     if proc.returncode != case["expected_exit"]:
         return False, f"exit={proc.returncode}, want {case['expected_exit']}", dt, stderr
@@ -112,6 +138,9 @@ def run_case(case: dict) -> tuple[bool, str, float, str]:
     for s in case.get("must_not_contain", []):
         if s in stderr:
             return False, f"stderr unexpectedly contains {s!r}", dt, stderr
+    for s in case.get("must_contain_stdout", []):
+        if s not in stdout:
+            return False, f"stdout missing {s!r}", dt, stderr
     return True, f"exit={proc.returncode}", dt, stderr
 
 

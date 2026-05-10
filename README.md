@@ -25,10 +25,12 @@ Because the check is structural (every ret matches a recorded call), the detecto
 What attacks are we able to detect:
 - [x] Buffer overflows/Code injection — `attacks/01-stack-bof/`
 - [x] Return Oriented Programming — `attacks/02-rop/` (3-gadget chain, detected at first hijacked `ret`)
-    - [ ] Jump Oriented Programming
+    - [~] Jump Oriented Programming — `attacks/03-jop/` (PoC works; **NOT yet detected** — see below)
     - [ ] Function reuse
 - [ ] Data-only attacks
 - [ ] Non-control Data overflows
+
+> **Known gap.** The shadow stack catches every control-flow hijack that subverts the call/return contract (any `ret` to a non-call-site fails immediately). It does **not** catch indirect-branch hijacks that never execute a `ret` — e.g. a `blr Xn` that jumps to a `br x16` gadget which terminates in `_exit()`. `attacks/03-jop/` is exactly this PoC; the test harness's `03-jop :: attack (gap demo)` case is intentionally green when the attack succeeds. Closing this gap requires per-call-site CFG-edge validation (planned).
 
 ## Development Environment (optional but recommended)
 
@@ -136,13 +138,16 @@ make clean    # clean every component
 
 Expected `make test` output:
 ```
-[ ok ] 01-stack-bof :: benign            (    63ms)  exit=0
-[ ok ] 01-stack-bof :: attack            (   908ms)  exit=2
-[ ok ] 02-rop :: benign                  (    82ms)  exit=0
-[ ok ] 02-rop :: attack                  (  1084ms)  exit=2
+[ ok ] 01-stack-bof :: benign            (    89ms)  exit=0
+[ ok ] 01-stack-bof :: attack            (  1271ms)  exit=2
+[ ok ] 02-rop :: benign                  (    47ms)  exit=0
+[ ok ] 02-rop :: attack                  (  1331ms)  exit=2
+[ ok ] 03-jop :: benign                  (    50ms)  exit=0
+[ ok ] 03-jop :: attack (gap demo)       (  1450ms)  exit=0
 
-4 passed, 0 failed
+6 passed, 0 failed
 ```
+The `03-jop :: attack (gap demo)` case is GREEN when the attack succeeds (tracer exit 0, "PWNED via JOP chain" on stdout, no detector alert). It documents the indirect-branch gap.
 Shell exit code is 0 on success, 1 if any case fails.
 
 ### Adding a new attack to the test matrix
