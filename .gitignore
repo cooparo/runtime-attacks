@@ -41,3 +41,8 @@ __pycache__/
 # ...even if they are in subdirectories
 !*/
 .claude/settings.local.json
+
+# GitHub Actions workflows
+!/.github/
+!/.github/workflows/
+!/.github/workflows/*.yml
