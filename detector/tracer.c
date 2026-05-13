@@ -1,27 +1,42 @@
 /*
- * tracer.c — iteration 1 detector.
+ * tracer.c — C-FLAT-style control-flow integrity monitor (L1).
  *
- * Forks the victim, attaches via PTRACE_TRACEME, then:
- *   1. plants a one-shot BRK at the victim ELF's e_entry (skips ld.so
- *      and libc startup, both of which would otherwise dominate runtime
- *      under single-step);
- *   2. PTRACE_CONTs until that BRK fires;
- *   3. restores the original instruction at e_entry and enters the
- *      single-step loop.
+ * Runs the victim under ptrace single-step and validates *every taken
+ * control-flow transfer* inside the victim's .text against a statically
+ * recovered CFG (see tools/build_cfg.py and detector/cfg.c):
  *
- * In the loop, decode happens BEFORE the step: we peek the instruction
- * at the current PC and act on it after the step lands. After a taken
- * branch the post-step PC points at the branch target, not at PC-4 of
- * the original branch, so a post-step decode at PC-4 would read garbage
- * for exactly the instructions we care about.
+ *   - bl / blr into .text  -> destination must be a legal call target
+ *                             (cfg_is_call_target: a function that is called
+ *                             directly somewhere, or whose address is taken);
+ *                             push return site onto the shadow call stack.
+ *   - bl / blr / br whose target leaves .text  -> a library (PLT->libc)
+ *                             call: plant a one-shot BRK at the return
+ *                             site and PTRACE_CONT over libc instead of
+ *                             single-stepping it (C-FLAT attests the app,
+ *                             not libc).
+ *   - ret                  -> destination must equal the shadow-stack top.
+ *   - direct / conditional branch (b, b.<cc>, cbz/cbnz, tbz/tbnz) taken
+ *                          -> (branch_site -> destination) must be a known
+ *                             CFG edge (cfg_has_edge).
+ *   - br Xn into .text     -> destination must be a known basic-block
+ *                             start or call target (conservative — catches
+ *                             JOP gadget chains and wild jumps).
  *
- *   - bl  imm    : after step, push (pre_pc + 4) to shadow stack
- *   - blr Xn     : after step, push (pre_pc + 4) to shadow stack
- *   - ret        : after step, compare actual PC against shadow-stack top
- *                   → mismatch = ATTACK
+ * Any violation -> "[!!! ATTACK DETECTED] ..." on stderr, PTRACE_KILL,
+ * exit 2. On every exit the cumulative hash chain (hashchain.c) over the
+ * executed transfers is printed as "[attestation] cfg-hash = 0x...".
  *
- * Direct b/b.cond and indirect br are unhandled in this iteration
- * (no CFG validation yet — deferred to iter 2).
+ * Decode happens BEFORE the step: we peek the instruction at the current
+ * PC, single-step, then look at the post-step PC. After a taken branch
+ * the post-step PC is the branch target, not PC-4 of the branch, so a
+ * post-step decode would read the wrong instruction.
+ *
+ * Startup: fork + PTRACE_TRACEME + exec; plant a one-shot BRK at `main`
+ * (fallback: ELF e_entry) and PTRACE_CONT through ld.so + glibc startup
+ * (single-stepping those is prohibitively slow and isn't what we attest);
+ * restore the instruction, pre-push the initial X30 so main's epilogue
+ * ret is checkable, then single-step. Pre-main code (.init_array) and
+ * post-detach glibc cleanup run unobserved — out of scope, as before.
  */
 
 #define _GNU_SOURCE
@@ -38,10 +53,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "cfg.h"
+#include "hashchain.h"
 #include "shadow_stack.h"
 
+/* ------------------------------------------------------------------ */
+/* AArch64 instruction decode                                          */
+/* ------------------------------------------------------------------ */
+
 typedef enum {
-  INSN_OTHER = 0,
+  INSN_OTHER = 0, /* not a branch, OR a direct/conditional branch (b, b.cc,
+                     cbz/cbnz, tbz/tbnz) — these we recognize implicitly via
+                     "post.pc is not sequential", no separate encoding needed */
   INSN_BL,
   INSN_BLR,
   INSN_BR,
@@ -49,15 +72,14 @@ typedef enum {
 } insn_kind_t;
 
 /*
- * AArch64 branch encodings (32-bit, little-endian):
- *   bl  imm26 : top 6 bits = 0b100101            → (insn >> 26) == 0x25
- *   blr Xn    : 11010110 0011 1111 0000 00 Rn 00000  → (insn & 0xFFFFFC1F) ==
- * 0xD63F0000 br  Xn    : 11010110 0001 1111 0000 00 Rn 00000  → (insn &
- * 0xFFFFFC1F) == 0xD61F0000 ret Xn    : 11010110 0101 1111 0000 00 Rn 00000  →
- * (insn & 0xFFFFFC1F) == 0xD65F0000
+ * Encodings (32-bit, little-endian):
+ *   bl  imm26 : (insn >> 26) == 0b100101
+ *   blr Xn    : (insn & 0xFFFFFC1F) == 0xD63F0000
+ *   br  Xn    : (insn & 0xFFFFFC1F) == 0xD61F0000
+ *   ret {Xn}  : (insn & 0xFFFFFC1F) == 0xD65F0000
  */
 static insn_kind_t decode_branch(uint32_t insn) {
-  if ((insn >> 26) == 0x25)
+  if ((insn >> 26) == 0x25U)
     return INSN_BL;
   if ((insn & 0xFFFFFC1FU) == 0xD63F0000U)
     return INSN_BLR;
@@ -67,6 +89,10 @@ static insn_kind_t decode_branch(uint32_t insn) {
     return INSN_RET;
   return INSN_OTHER;
 }
+
+/* ------------------------------------------------------------------ */
+/* ptrace helpers                                                      */
+/* ------------------------------------------------------------------ */
 
 static int read_regs(pid_t pid, struct user_regs_struct *regs) {
   struct iovec iov = {.iov_base = regs, .iov_len = sizeof(*regs)};
@@ -82,14 +108,11 @@ static int peek_insn(pid_t pid, uint64_t addr, uint32_t *out) {
   return 0;
 }
 
-/* AArch64 BRK #0 — synchronous breakpoint, raises SIGTRAP. */
+/* AArch64 BRK #0 — synchronous breakpoint, raises SIGTRAP (PC stays put). */
 #define BRK_INSN 0xD4200000U
 
-/*
- * Plant a 4-byte BRK at addr while preserving the adjacent 4 bytes.
- * PTRACE_PEEKTEXT/POKETEXT operate on 8-byte words on aarch64, so we
- * read 8 bytes, replace only the low 4 (little-endian => bytes at addr).
- */
+/* Replace the 4 bytes at addr with BRK, preserving the adjacent 4 bytes
+ * (PEEK/POKETEXT operate on 8-byte words on aarch64). */
 static int plant_breakpoint(pid_t pid, uint64_t addr, uint32_t *orig_out) {
   errno = 0;
   long word = ptrace(PTRACE_PEEKTEXT, pid, (void *)(uintptr_t)addr, NULL);
@@ -98,10 +121,8 @@ static int plant_breakpoint(pid_t pid, uint64_t addr, uint32_t *orig_out) {
   *orig_out = (uint32_t)((uint64_t)word & 0xFFFFFFFFULL);
   uint64_t patched =
       ((uint64_t)word & 0xFFFFFFFF00000000ULL) | (uint64_t)BRK_INSN;
-  if (ptrace(PTRACE_POKETEXT, pid, (void *)(uintptr_t)addr,
-             (void *)(uintptr_t)patched) < 0)
-    return -1;
-  return 0;
+  return ptrace(PTRACE_POKETEXT, pid, (void *)(uintptr_t)addr,
+                (void *)(uintptr_t)patched);
 }
 
 static int restore_breakpoint(pid_t pid, uint64_t addr, uint32_t orig_insn) {
@@ -111,35 +132,28 @@ static int restore_breakpoint(pid_t pid, uint64_t addr, uint32_t orig_insn) {
     return -1;
   uint64_t restored =
       ((uint64_t)word & 0xFFFFFFFF00000000ULL) | (uint64_t)orig_insn;
-  if (ptrace(PTRACE_POKETEXT, pid, (void *)(uintptr_t)addr,
-             (void *)(uintptr_t)restored) < 0)
-    return -1;
-  return 0;
+  return ptrace(PTRACE_POKETEXT, pid, (void *)(uintptr_t)addr,
+                (void *)(uintptr_t)restored);
 }
+
+/* ------------------------------------------------------------------ */
+/* ELF symbol lookup (to find `main`)                                  */
+/* ------------------------------------------------------------------ */
 
 static int read_elf_entry(const char *path, uint64_t *entry_out) {
   FILE *f = fopen(path, "rb");
   if (!f)
     return -1;
   Elf64_Ehdr ehdr;
-  if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-    fclose(f);
-    return -1;
-  }
+  int ok = (fread(&ehdr, sizeof(ehdr), 1, f) == 1);
   fclose(f);
-  if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0)
-    return -1;
-  if (ehdr.e_ident[EI_CLASS] != ELFCLASS64)
+  if (!ok || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+      ehdr.e_ident[EI_CLASS] != ELFCLASS64)
     return -1;
   *entry_out = (uint64_t)ehdr.e_entry;
   return 0;
 }
 
-/*
- * Look up a STT_FUNC symbol by name in the ELF's .symtab.
- * Returns 0 on success and writes st_value to *out, -1 otherwise.
- * Used to find `main` so we can skip glibc startup with a BRK there.
- */
 static int find_symbol(const char *path, const char *symname, uint64_t *out) {
   FILE *f = fopen(path, "rb");
   if (!f)
@@ -153,9 +167,8 @@ static int find_symbol(const char *path, const char *symname, uint64_t *out) {
   Elf64_Ehdr eh;
   if (fread(&eh, sizeof(eh), 1, f) != 1)
     goto out;
-  if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
-    goto out;
-  if (eh.e_ident[EI_CLASS] != ELFCLASS64)
+  if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+      eh.e_ident[EI_CLASS] != ELFCLASS64)
     goto out;
 
   shdrs = calloc(eh.e_shnum, sizeof(*shdrs));
@@ -167,12 +180,11 @@ static int find_symbol(const char *path, const char *symname, uint64_t *out) {
     goto out;
 
   int symtab_idx = -1;
-  for (size_t i = 0; i < eh.e_shnum; i++) {
+  for (size_t i = 0; i < eh.e_shnum; i++)
     if (shdrs[i].sh_type == SHT_SYMTAB) {
       symtab_idx = (int)i;
       break;
     }
-  }
   if (symtab_idx < 0)
     goto out;
 
@@ -219,9 +231,131 @@ out:
   return rc;
 }
 
+/* ------------------------------------------------------------------ */
+/* monitor state + reporting                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+  size_t steps;
+  size_t calls;     /* bl + blr into .text */
+  size_t libcalls;  /* calls/jumps that left .text (run-to-return) */
+  size_t rets;
+  size_t branches;  /* taken direct/conditional/indirect-jump transfers */
+  size_t alerts;
+} stats_t;
+
+static void print_summary(const stats_t *st, hashchain_t *hc, const char *why) {
+  fprintf(stderr,
+          "[tracer] %s — steps=%zu calls=%zu libcalls=%zu rets=%zu "
+          "branches=%zu alerts=%zu\n",
+          why, st->steps, st->calls, st->libcalls, st->rets, st->branches,
+          st->alerts);
+  fprintf(stderr, "[attestation] cfg-hash = 0x%016lx%s\n", hc_value(hc),
+          st->alerts ? " (partial — run aborted on detection)" : "");
+}
+
+#define ALERT(st, kind, site, fmt, ...)                                        \
+  do {                                                                         \
+    fprintf(stderr,                                                            \
+            "\n[!!! ATTACK DETECTED] %s at 0x%lx : " fmt "\n", (kind),         \
+            (unsigned long)(site), ##__VA_ARGS__);                             \
+    (st).alerts++;                                                             \
+  } while (0)
+
+/* Reap the tracee after a kill/detach and translate to an exit code. */
+static int finish(pid_t pid, const stats_t *st, hashchain_t *hc,
+                  const char *why) {
+  int status;
+  waitpid(pid, &status, 0);
+  print_summary(st, hc, why);
+  return st->alerts ? 2 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* library-call handling: run-to-return-breakpoint                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The just-executed call/jump landed outside .text (PLT -> libc). PC is
+ * at the first PLT/libc instruction. Plant a one-shot BRK at `ret_site`
+ * (which is in .text), PTRACE_CONT until it fires, restore. Returns 0 on
+ * success, -1 on a fatal ptrace/wait error; *exited is set if the tracee
+ * terminated during the excursion.
+ */
+static int run_to(pid_t pid, uint64_t ret_site, int *exited, int *exit_status) {
+  *exited = 0;
+  uint32_t orig;
+  if (plant_breakpoint(pid, ret_site, &orig) < 0) {
+    perror("plant_breakpoint(ret_site)");
+    return -1;
+  }
+  long cont_sig = 0; /* signal to deliver on the next PTRACE_CONT, if any */
+  for (;;) {
+    if (ptrace(PTRACE_CONT, pid, NULL, (void *)cont_sig) < 0) {
+      perror("PTRACE_CONT(libcall)");
+      return -1;
+    }
+    cont_sig = 0;
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+      perror("waitpid(libcall)");
+      return -1;
+    }
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+      *exited = 1;
+      *exit_status = status;
+      return 0; /* tracee gone; nothing to restore */
+    }
+    if (!WIFSTOPPED(status))
+      continue;
+    int sig = WSTOPSIG(status);
+    if (sig == SIGTRAP)
+      break; /* hit our breakpoint at ret_site */
+    cont_sig = sig; /* forward other signals into the tracee */
+  }
+  if (restore_breakpoint(pid, ret_site, orig) < 0) {
+    perror("restore_breakpoint(ret_site)");
+    return -1;
+  }
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
+
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: %s <victim_binary> [args...]\n", argv[0]);
+  const char *cfg_path = NULL;
+  int ai = 1;
+  if (ai < argc && strcmp(argv[ai], "--cfg") == 0) {
+    if (ai + 1 >= argc) {
+      fprintf(stderr, "Usage: %s [--cfg PATH] <victim> [args...]\n", argv[0]);
+      return 1;
+    }
+    cfg_path = argv[ai + 1];
+    ai += 2;
+  }
+  if (ai >= argc) {
+    fprintf(stderr, "Usage: %s [--cfg PATH] <victim> [args...]\n", argv[0]);
+    return 1;
+  }
+  const char *victim = argv[ai];
+
+  /* Default CFG path: "<victim>.cfg". */
+  char cfg_buf[4096];
+  if (!cfg_path) {
+    int n = snprintf(cfg_buf, sizeof(cfg_buf), "%s.cfg", victim);
+    if (n < 0 || n >= (int)sizeof(cfg_buf)) {
+      fprintf(stderr, "[tracer] victim path too long\n");
+      return 1;
+    }
+    cfg_path = cfg_buf;
+  }
+  cfg_t *cfg = cfg_load(cfg_path);
+  if (!cfg) {
+    fprintf(stderr,
+            "[tracer] no CFG — run `python3 tools/build_cfg.py %s` first\n",
+            victim);
     return 1;
   }
 
@@ -230,21 +364,22 @@ int main(int argc, char **argv) {
     perror("fork");
     return 1;
   }
-
   if (pid == 0) {
-    /* Child: opt into being traced, then exec the victim. */
     if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
       perror("ptrace(TRACEME)");
       _exit(127);
     }
-    execv(argv[1], &argv[1]);
+    execv(victim, &argv[ai]);
     perror("execv");
     _exit(127);
   }
 
-  /* Parent: tracer. */
+  /* --- parent: the tracer --- */
   shadow_stack_init();
-  fprintf(stderr, "[tracer] pid=%d binary=%s\n", pid, argv[1]);
+  hashchain_t hc;
+  hc_init(&hc);
+  stats_t st = {0};
+  fprintf(stderr, "[tracer] pid=%d victim=%s\n", pid, victim);
 
   int status;
   if (waitpid(pid, &status, 0) < 0) {
@@ -256,53 +391,44 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  /*
-   * Plant a one-shot BRK at `main` (or fall back to e_entry if the
-   * symbol isn't in the table) and PTRACE_CONT through ld.so + glibc
-   * startup. Single-stepping the dynamic linker and __libc_start_main
-   * is prohibitively slow under PTRACE_SINGLESTEP, and they aren't
-   * what we're trying to validate.
-   */
+  /* Skip ld.so + __libc_start_main: one-shot BRK at `main`, PTRACE_CONT. */
   uint64_t bp_addr;
   const char *bp_name;
-  if (find_symbol(argv[1], "main", &bp_addr) == 0) {
+  if (find_symbol(victim, "main", &bp_addr) == 0) {
     bp_name = "main";
-  } else if (read_elf_entry(argv[1], &bp_addr) == 0) {
+  } else if (read_elf_entry(victim, &bp_addr) == 0) {
     bp_name = "e_entry";
-    fprintf(stderr,
-            "[tracer] symbol `main` not found, falling back to e_entry\n");
+    fprintf(stderr, "[tracer] symbol `main` not found — falling back to e_entry\n");
   } else {
-    fprintf(stderr, "[tracer] cannot parse ELF of %s\n", argv[1]);
+    fprintf(stderr, "[tracer] cannot parse ELF of %s\n", victim);
     return 1;
   }
-  fprintf(stderr,
-          "[tracer] %s=0x%lx — running pre-main code under PTRACE_CONT\n",
+  fprintf(stderr, "[tracer] %s=0x%lx — running pre-main code under PTRACE_CONT\n",
           bp_name, bp_addr);
 
   uint32_t orig_at_bp;
   if (plant_breakpoint(pid, bp_addr, &orig_at_bp) < 0) {
-    perror("plant_breakpoint");
+    perror("plant_breakpoint(main)");
     return 1;
   }
-
   if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
-    perror("PTRACE_CONT (to bp)");
+    perror("PTRACE_CONT(to main)");
     return 1;
   }
   if (waitpid(pid, &status, 0) < 0) {
-    perror("waitpid(bp)");
+    perror("waitpid(main bp)");
     return 1;
   }
   if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-    fprintf(stderr, "[tracer] expected SIGTRAP at %s; got status=0x%x\n",
-            bp_name, status);
+    fprintf(stderr, "[tracer] expected SIGTRAP at %s; status=0x%x\n", bp_name,
+            status);
     return 1;
   }
   uint64_t initial_x30;
   {
     struct user_regs_struct r;
     if (read_regs(pid, &r) < 0) {
-      perror("read_regs(bp)");
+      perror("read_regs(main bp)");
       return 1;
     }
     if (r.pc != bp_addr) {
@@ -313,163 +439,208 @@ int main(int argc, char **argv) {
     initial_x30 = (uint64_t)r.regs[30];
   }
   if (restore_breakpoint(pid, bp_addr, orig_at_bp) < 0) {
-    perror("restore_breakpoint");
+    perror("restore_breakpoint(main)");
     return 1;
   }
-
-  /*
-   * Pre-push X30 (= the address that called us, e.g. __libc_start_main's
-   * continuation when bp_name == "main"). This makes main's epilogue ret
-   * verifiable: we never saw the bl that called main (PTRACE_CONT skipped
-   * it), but we know the legitimate return address right now and want to
-   * detect any corruption of main's saved x30.
-   */
+  /* Pre-push the return-into-libc address so main's epilogue ret is
+   * checkable even though we never saw the bl that called main. */
   shadow_stack_push(initial_x30);
+  hc_fold(&hc, bp_addr); /* path starts at main */
   fprintf(stderr,
-          "[tracer] reached %s — pre-pushed initial X30=0x%lx; switching to "
-          "single-step\n",
+          "[tracer] reached %s — pre-pushed initial X30=0x%lx; single-stepping\n",
           bp_name, initial_x30);
 
-  size_t step_count = 0;
-  size_t bl_count = 0;
-  size_t ret_count = 0;
-  size_t alert_count = 0;
-
+  /* --- single-step loop --- */
   for (;;) {
-    /* PRE-STEP: read PC, peek instruction about to execute, decode. */
     struct user_regs_struct pre;
     if (read_regs(pid, &pre) < 0) {
-      perror("PTRACE_GETREGSET (pre)");
+      perror("read_regs(pre)");
       return 1;
     }
     uint64_t pre_pc = pre.pc;
 
-    uint32_t insn;
+    uint32_t insn = 0;
     insn_kind_t kind = INSN_OTHER;
-    if (peek_insn(pid, pre_pc, &insn) == 0) {
+    if (peek_insn(pid, pre_pc, &insn) == 0)
       kind = decode_branch(insn);
-    }
 
-    /* STEP. */
     if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0) {
       perror("PTRACE_SINGLESTEP");
       return 1;
     }
     if (waitpid(pid, &status, 0) < 0) {
-      perror("waitpid");
+      perror("waitpid(step)");
       return 1;
     }
-
     if (WIFEXITED(status)) {
-      fprintf(stderr,
-              "[tracer] tracee exited status=%d  steps=%zu  bl=%zu  ret=%zu  "
-              "alerts=%zu\n",
-              WEXITSTATUS(status), step_count, bl_count, ret_count,
-              alert_count);
-      return alert_count > 0 ? 2 : 0;
+      print_summary(&st, &hc, "tracee exited");
+      return st.alerts ? 2 : 0;
     }
     if (WIFSIGNALED(status)) {
-      fprintf(stderr, "[tracer] tracee killed by signal %d  alerts=%zu\n",
-              WTERMSIG(status), alert_count);
-      return alert_count > 0 ? 2 : 1;
+      print_summary(&st, &hc, "tracee killed by signal");
+      return st.alerts ? 2 : 1;
     }
     if (!WIFSTOPPED(status))
       continue;
-
     int sig = WSTOPSIG(status);
     if (sig != SIGTRAP) {
-      /* Forward the signal back to the tracee. */
       if (ptrace(PTRACE_SINGLESTEP, pid, NULL, (void *)(long)sig) < 0) {
-        perror("PTRACE_SINGLESTEP forward");
+        perror("PTRACE_SINGLESTEP(fwd)");
         return 1;
       }
       continue;
     }
 
-    step_count++;
+    st.steps++;
+
+    struct user_regs_struct post;
+    if (read_regs(pid, &post) < 0) {
+      perror("read_regs(post)");
+      return 1;
+    }
+    uint64_t dst = post.pc;
+
+    /* Sequential fall-through: nothing to validate (can't fall through to
+     * an arbitrary address). */
+    if (dst == pre_pc + 4)
+      continue;
 
     switch (kind) {
+    /* --------------------------------------------------------------- */
     case INSN_BL:
     case INSN_BLR: {
-      /* Return address pushed by the call = pre_pc + 4. */
-      shadow_stack_push(pre_pc + 4);
-      bl_count++;
+      uint64_t ret_site = pre_pc + 4;
+      if (!cfg_in_text(cfg, dst)) {
+        /* Library call (PLT -> libc): attest the app, not libc. */
+        shadow_stack_push(ret_site);
+        int exited = 0, ex_status = 0;
+        if (run_to(pid, ret_site, &exited, &ex_status) < 0)
+          return 1;
+        if (exited) {
+          if (WIFEXITED(ex_status)) {
+            print_summary(&st, &hc, "tracee exited (in library)");
+            return st.alerts ? 2 : 0;
+          }
+          print_summary(&st, &hc, "tracee killed by signal (in library)");
+          return st.alerts ? 2 : 1;
+        }
+        uint64_t exp;
+        shadow_stack_pop(&exp); /* the ret_site we just pushed */
+        hc_fold(&hc, ret_site);
+        st.libcalls++;
+        continue;
+      }
+      /* Call into .text: target must be a legal call target (a function the
+       * program calls directly or takes the address of — not an arbitrary
+       * function-entry-shaped gadget). */
+      if (!cfg_is_call_target(cfg, dst)) {
+        ALERT(st, kind == INSN_BL ? "bl" : "blr", pre_pc,
+              "destination 0x%lx is not a legal call target", (unsigned long)dst);
+        ptrace(PTRACE_KILL, pid, NULL, NULL);
+        return finish(pid, &st, &hc, "tracee killed after detection");
+      }
+      shadow_stack_push(ret_site);
+      hc_fold(&hc, dst);
+      st.calls++;
       break;
     }
+    /* --------------------------------------------------------------- */
     case INSN_RET: {
-      struct user_regs_struct post;
-      if (read_regs(pid, &post) < 0) {
-        perror("PTRACE_GETREGSET (post)");
-        return 1;
-      }
-      uint64_t actual = post.pc;
-      uint64_t expected;
-      if (shadow_stack_pop(&expected) < 0) {
-        /* Pre-push at startup makes this unreachable in normal runs. */
-        fprintf(stderr, "[tracer] BUG: ret at 0x%lx with empty shadow stack\n",
-                pre_pc);
+      uint64_t exp;
+      if (shadow_stack_pop(&exp) < 0) {
+        ALERT(st, "ret", pre_pc, "return with empty shadow stack (got 0x%lx)",
+              (unsigned long)dst);
         ptrace(PTRACE_KILL, pid, NULL, NULL);
-        waitpid(pid, &status, 0);
-        return 1;
+        return finish(pid, &st, &hc, "tracee killed after detection");
       }
-      ret_count++;
-      if (actual != expected) {
-        fprintf(stderr,
-                "\n[!!! ATTACK DETECTED] ret at 0x%lx: expected 0x%lx, got "
-                "0x%lx (depth=%zu, step=%zu)\n",
-                pre_pc, expected, actual, shadow_stack_depth(), step_count);
-        alert_count++;
+      st.rets++;
+      if (dst != exp) {
+        ALERT(st, "ret", pre_pc, "expected 0x%lx, got 0x%lx (depth=%zu)",
+              (unsigned long)exp, (unsigned long)dst, shadow_stack_depth());
         ptrace(PTRACE_KILL, pid, NULL, NULL);
-        waitpid(pid, &status, 0);
-        fprintf(stderr,
-                "[tracer] tracee killed after detection  steps=%zu  bl=%zu  "
-                "ret=%zu\n",
-                step_count, bl_count, ret_count);
-        return 2;
+        return finish(pid, &st, &hc, "tracee killed after detection");
       }
       if (shadow_stack_depth() == 0) {
-        /*
-         * The pre-pushed return has just been consumed → main has
-         * returned cleanly. User-code instrumentation is done;
-         * detach and let glibc cleanup + _exit run unobserved.
-         */
-        fprintf(stderr,
-                "[tracer] depth=0 after ret at 0x%lx — main returned cleanly, "
-                "detaching\n",
-                pre_pc);
+        /* The pre-pushed return was just consumed: main returned cleanly.
+         * Don't fold the return-into-libc address (out of the attested
+         * region, and ASLR'd). Detach and let glibc cleanup run. */
+        fprintf(stderr, "[tracer] main returned cleanly — detaching\n");
         if (ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
           perror("PTRACE_DETACH");
           return 1;
         }
-        if (waitpid(pid, &status, 0) < 0) {
-          perror("waitpid (detach)");
-          return 1;
-        }
-        if (WIFEXITED(status)) {
-          fprintf(stderr,
-                  "[tracer] tracee exited status=%d  steps=%zu  bl=%zu  "
-                  "ret=%zu  alerts=%zu\n",
-                  WEXITSTATUS(status), step_count, bl_count, ret_count,
-                  alert_count);
-          return alert_count > 0 ? 2 : 0;
-        }
-        if (WIFSIGNALED(status)) {
-          fprintf(
-              stderr,
-              "[tracer] tracee killed by signal %d after detach  alerts=%zu\n",
-              WTERMSIG(status), alert_count);
-          return alert_count > 0 ? 2 : 1;
-        }
-        fprintf(stderr, "[tracer] unexpected post-detach status=0x%x\n",
-                status);
-        return alert_count > 0 ? 2 : 1;
+        return finish(pid, &st, &hc, "tracee detached after clean return");
       }
+      hc_fold(&hc, dst);
       break;
     }
-    case INSN_BR:
-    case INSN_OTHER:
-    default:
+    /* --------------------------------------------------------------- */
+    case INSN_BR: {
+      if (!cfg_in_text(cfg, dst)) {
+        /* Indirect jump out of .text — e.g. a PLT thunk reached via br.
+         * It returns (eventually) to wherever the *current* return
+         * address points; the closest in-.text resume point we can pin
+         * is the shadow-stack top. */
+        uint64_t ret_site;
+        if (shadow_stack_pop(&ret_site) < 0) {
+          ALERT(st, "br", pre_pc, "indirect jump out of .text to 0x%lx with "
+                "empty shadow stack", (unsigned long)dst);
+          ptrace(PTRACE_KILL, pid, NULL, NULL);
+          return finish(pid, &st, &hc, "tracee killed after detection");
+        }
+        shadow_stack_push(ret_site);
+        int exited = 0, ex_status = 0;
+        if (run_to(pid, ret_site, &exited, &ex_status) < 0)
+          return 1;
+        if (exited) {
+          if (WIFEXITED(ex_status)) {
+            print_summary(&st, &hc, "tracee exited (in library)");
+            return st.alerts ? 2 : 0;
+          }
+          print_summary(&st, &hc, "tracee killed by signal (in library)");
+          return st.alerts ? 2 : 1;
+        }
+        uint64_t exp;
+        shadow_stack_pop(&exp);
+        hc_fold(&hc, ret_site);
+        st.libcalls++;
+        continue;
+      }
+      /* Indirect jump within .text: conservative — must land on a known
+       * basic-block start or function entry (catches JOP gadget chains
+       * and wild jumps; over-accepts vs. a precise per-site target set). */
+      if (!cfg_is_bb_start(cfg, dst) && !cfg_is_call_target(cfg, dst)) {
+        ALERT(st, "br", pre_pc, "destination 0x%lx is not a CFG node",
+              (unsigned long)dst);
+        ptrace(PTRACE_KILL, pid, NULL, NULL);
+        return finish(pid, &st, &hc, "tracee killed after detection");
+      }
+      hc_fold(&hc, dst);
+      st.branches++;
       break;
+    }
+    /* --------------------------------------------------------------- */
+    case INSN_OTHER:
+    default: {
+      /* Non-sequential PC after a non-{bl,blr,br,ret} instruction => the
+       * instruction was a direct/conditional branch (b, b.<cc>, cbz/cbnz,
+       * tbz/tbnz) that was taken. Validate the CFG edge. */
+      if (!cfg_in_text(cfg, dst)) {
+        ALERT(st, "branch", pre_pc, "direct branch leaves .text to 0x%lx",
+              (unsigned long)dst);
+        ptrace(PTRACE_KILL, pid, NULL, NULL);
+        return finish(pid, &st, &hc, "tracee killed after detection");
+      }
+      if (!cfg_has_edge(cfg, pre_pc, dst)) {
+        ALERT(st, "branch", pre_pc, "unknown CFG edge -> 0x%lx",
+              (unsigned long)dst);
+        ptrace(PTRACE_KILL, pid, NULL, NULL);
+        return finish(pid, &st, &hc, "tracee killed after detection");
+      }
+      hc_fold(&hc, dst);
+      st.branches++;
+      break;
+    }
     }
   }
 }

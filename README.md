@@ -6,31 +6,40 @@ AAU project on runtime software attacks — research, PoC, detection, and evalua
 
 ## What the detector does
 
-The detector (`detector/tracer`) is a **user-space shadow call stack** built on the Linux `ptrace` API. It enforces call/return discipline at runtime: every `ret` must return to the address recorded by its matching `bl`/`blr`. Any deviation is flagged as an attack.
+The detector is a **C-FLAT-style control-flow integrity monitor** that runs entirely in userspace. It has two halves:
+
+**Offline — `tools/build_cfg.py`.** Disassembles the victim ELF's `.text` (pyelftools + capstone), recovers basic blocks, direct/conditional-branch edges, and the set of legal indirect-call targets (functions the program calls directly or takes the address of — coarse-grained forward-edge CFI, *not* "any function entry"), and writes a flat text `<victim>.cfg` (plus a `<victim>.dot` call graph for eyeballing).
+
+**Online — `detector/tracer`.** Runs the victim under `ptrace` single-step and validates **every taken control-flow transfer** inside `.text` against that CFG, plus a shadow call stack for returns, while folding each transfer's destination into a cumulative non-cryptographic hash (FNV-1a 64-bit) — a path "attestation token" printed at exit.
 
 Flow per traced process:
 
-1. **Fork + `PTRACE_TRACEME`** — child execs the victim, parent becomes the tracer.
-2. **One-shot `BRK` at `main`** — `PTRACE_CONT` past `ld.so` and `__libc_start_main` (single-stepping them is prohibitively slow on a Pi). When the BRK fires, the original instruction is restored and the legitimate return-into-libc address is pre-pushed to the shadow stack.
-3. **Single-step loop from `main`** — peek the next AArch64 instruction at the current PC and decode:
-    - `bl imm` / `blr Xn` → push `pre_pc + 4` (the return site) to the shadow stack
-    - `ret` → pop the expected target and compare against the actual post-step PC
-    - mismatch → `[!!! ATTACK DETECTED]` to stderr, `PTRACE_KILL` the tracee, exit with code `2`
-4. **Clean detach** — when main returns and the shadow stack drains, detach and let glibc cleanup run unobserved.
+1. **Fork + `PTRACE_TRACEME`** — child execs the victim, parent becomes the tracer; load `<victim>.cfg`.
+2. **One-shot `BRK` at `main`** — `PTRACE_CONT` past `ld.so` and `__libc_start_main` (single-stepping them is prohibitively slow on a Pi, and isn't what we attest). When the BRK fires, the original instruction is restored and the legitimate return-into-libc address is pre-pushed to the shadow stack.
+3. **Single-step loop from `main`** — peek and decode the AArch64 instruction at the current PC *before* stepping (after a taken branch, post-step PC is the target, not PC+4); then on a non-sequential post-step PC, validate the transfer:
+    - `bl` / `blr` whose target leaves `.text` → a library call (PLT → libc): plant a one-shot `BRK` at the return site and `PTRACE_CONT` over libc (C-FLAT attests the app, not libc), then resume stepping.
+    - `bl` / `blr` into `.text` → destination must be a legal call target (`cfg_is_call_target`); push the return site onto the shadow stack.
+    - `ret` → destination must equal the shadow-stack top.
+    - direct / conditional branch (`b`, `b.<cc>`, `cbz`/`cbnz`, `tbz`/`tbnz`) taken → `(branch_site → destination)` must be a known CFG edge.
+    - `br Xn` into `.text` → destination must be a known basic-block start or call target (conservative — catches JOP gadget chains and wild jumps).
+    - any violation → `[!!! ATTACK DETECTED] <kind> at 0x… : <reason>` to stderr, `PTRACE_KILL` the tracee, exit `2`.
+4. **Clean detach** — when `main` returns and the shadow stack drains, detach and let glibc cleanup run unobserved.
 
-Because the check is structural (every ret matches a recorded call), the detector catches any control-flow hijack that subverts the call/return contract — including direct ret overwrite (stack buffer overflow) and full ROP chains — without per-attack signatures or a CFG model. It does **not** yet validate indirect-call (`blr`) targets or direct branches (`b`/`b.cond`); those are out of scope for the call/return shadow stack and require a CFG-edge model (planned for a later iteration).
+On every exit (clean or aborted) the tracer prints `[attestation] cfg-hash = 0x…` over the executed transfers, plus a one-line counter summary (steps / calls / libcalls / rets / branches / alerts).
+
+This is the **L1 (control-flow) axis** only. Because direct ret-overwrites and ROP both forge a `ret`, the shadow stack catches them; because the CFG model rejects an indirect call/branch to a target the program never legitimately uses, JOP-style chains that never touch a `ret` are caught too. Provenance of data and bounds of objects are not checked yet — see the roadmap.
 
 ## Roadmap
 
 What attacks are we able to detect:
-- [x] Buffer overflows/Code injection — `attacks/01-stack-bof/`
-- [x] Return Oriented Programming — `attacks/02-rop/` (3-gadget chain, detected at first hijacked `ret`)
-    - [~] Jump Oriented Programming — `attacks/03-jop/` (PoC works; **NOT yet detected** — see below)
-    - [ ] Function reuse
+- [x] Buffer overflows / code injection — `attacks/01-stack-bof/` (caught at the hijacked `ret`)
+- [x] Return-Oriented Programming — `attacks/02-rop/` (3-gadget chain, caught at the first hijacked `ret`)
+- [x] Jump-Oriented Programming — `attacks/03-jop/` (`blr`-pivot chain, caught at the pivot: not a legal call target)
+- [ ] Function reuse — whole-function gadgets reached via *legal* CFG edges (the L1 model accepts these)
 - [ ] Data-only attacks
-- [ ] Non-control Data overflows
+- [ ] Non-control-data overflows
 
-> **Known gap.** The shadow stack catches every control-flow hijack that subverts the call/return contract (any `ret` to a non-call-site fails immediately). It does **not** catch indirect-branch hijacks that never execute a `ret` — e.g. a `blr Xn` that jumps to a `br x16` gadget which terminates in `_exit()`. `attacks/03-jop/` is exactly this PoC; the test harness's `03-jop :: attack (gap demo)` case is intentionally green when the attack succeeds. Closing this gap requires per-call-site CFG-edge validation (planned).
+Next axes (not yet implemented): **L2** data-provenance tracking and **L3** object-bounds checking.
 
 ## Development Environment (optional but recommended)
 
@@ -96,11 +105,14 @@ direnv disallow
 
 ## Get started
 
-Inside the dev shell, build everything and run the tracer manually
-against an attack:
+Inside the dev shell, build everything, recover a victim's CFG, and run
+the tracer manually against an attack:
 
 ```sh
 make build
+
+# recover the static CFG once per victim (writes attacks/01-stack-bof/victim.cfg)
+python3 tools/build_cfg.py attacks/01-stack-bof/victim
 
 # benign run: payload is a clean line of text
 echo "hello" | ./detector/tracer attacks/01-stack-bof/victim
@@ -110,9 +122,14 @@ python3 attacks/01-stack-bof/exploit.py | ./detector/tracer attacks/01-stack-bof
 ```
 
 The tracer takes the victim path as argv and reads the victim's stdin
-from the pipe. Exit codes: `0` clean, `1` tracer error, `2` attack
-detected. On detection it prints
-`[!!! ATTACK DETECTED] ret at 0x... expected 0x... got 0x...` to stderr.
+from the pipe. It expects `<victim>.cfg` next to the binary (override
+with `--cfg PATH`); `make test` regenerates these automatically, but a
+manual run needs `build_cfg.py` first. Exit codes: `0` clean, `1`
+tracer error, `2` attack detected. On detection it prints
+`[!!! ATTACK DETECTED] <kind> at 0x… : <reason>` to stderr (e.g.
+`ret at 0x… : expected 0x…, got 0x…`, or `blr at 0x… : destination 0x…
+is not a legal call target`); on every exit it prints
+`[attestation] cfg-hash = 0x…`.
 
 If you are not already in the dev shell, prefix each command with
 `nix develop -c` (e.g. `nix develop -c make build`).
@@ -136,19 +153,27 @@ make test     # build (if needed) and run the matrix
 make clean    # clean every component
 ```
 
-Expected `make test` output:
+The harness regenerates each `<victim>.cfg` first (via `build_cfg.py`,
+echoing its function / BB / edge / indirect-call-target counts), then runs
+the matrix. Expected `make test` output:
 ```
-[ ok ] 01-stack-bof :: benign            (    89ms)  exit=0
-[ ok ] 01-stack-bof :: attack            (  1271ms)  exit=2
-[ ok ] 02-rop :: benign                  (    47ms)  exit=0
-[ ok ] 02-rop :: attack                  (  1331ms)  exit=2
-[ ok ] 03-jop :: benign                  (    50ms)  exit=0
-[ ok ] 03-jop :: attack (gap demo)       (  1450ms)  exit=0
+[harness] [build_cfg] 6 functions, 34 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
+[harness] [build_cfg] 8 functions, 38 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
+[harness] [build_cfg] 8 functions, 39 basic blocks, 16 edges, 3 indirect-call targets -> victim.cfg, victim.dot
+[ ok ] 01-stack-bof :: benign            (    12ms)  exit=0
+[ ok ] 01-stack-bof :: attack            (  1089ms)  exit=2
+[ ok ] 02-rop :: benign                  (    36ms)  exit=0
+[ ok ] 02-rop :: attack                  (  1084ms)  exit=2
+[ ok ] 03-jop :: benign                  (    12ms)  exit=0
+[ ok ] 03-jop :: attack                  (  1063ms)  exit=2
 
 6 passed, 0 failed
 ```
-The `03-jop :: attack (gap demo)` case is GREEN when the attack succeeds (tracer exit 0, "PWNED via JOP chain" on stdout, no detector alert). It documents the indirect-branch gap.
-Shell exit code is 0 on success, 1 if any case fails.
+Benign cases must exit `0` with an `[attestation] cfg-hash` line and no
+alert; attack cases must exit `2` with `[!!! ATTACK DETECTED]`.
+
+(Attack runs are ~100× slower — single-stepping the victim to the
+hijack point.) Shell exit code is 0 on success, 1 if any case fails.
 
 ### Adding a new attack to the test matrix
 
@@ -156,8 +181,8 @@ Shell exit code is 0 on success, 1 if any case fails.
    (mirror the layout of `attacks/01-stack-bof/`).
 2. Append two entries (one `benign`, one `attack`) to the `TESTS` list
    in `tools/run_tests.py`.
-3. `make test` will build the new attack and run it against the
-   detector automatically.
+3. `make test` will build the new attack, recover its CFG, and run it
+   against the detector automatically.
 
 ### Useful flags
 

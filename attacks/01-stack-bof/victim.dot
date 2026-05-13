@@ -1,0 +1,12 @@
+digraph CFG {
+  rankdir=LR;
+  node [shape=box, fontname=monospace];
+  "_dl_relocate_static_pie";
+  "_start";
+  "call_weak_fn";
+  "main";
+  "vuln";
+  "win";
+  "call_weak_fn" -> "call_weak_fn";
+  "main" -> "vuln";
+}

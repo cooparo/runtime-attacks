@@ -3,8 +3,10 @@
 run_tests.py - local matrix harness for runtime-attacks.
 
 Drives the matrix {benign, attack} x each attack dir against the current
-detector. Each case runs an input_cmd to produce payload bytes, pipes
-them as stdin to the tracer, and asserts on (exit_code, stderr).
+detector. Before the matrix it (re)generates each victim's static CFG with
+tools/build_cfg.py (the tracer needs `<victim>.cfg`). Each case then runs an
+input_cmd to produce payload bytes, pipes them as stdin to the tracer, and
+asserts on (exit_code, stdout/stderr).
 
 Usage:
     python3 tools/run_tests.py            # run all tests
@@ -26,6 +28,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRACER    = REPO_ROOT / "detector" / "tracer"
+BUILD_CFG = REPO_ROOT / "tools" / "build_cfg.py"
 
 # Each case:
 #   name                  human-readable identifier
@@ -35,15 +38,13 @@ TRACER    = REPO_ROOT / "detector" / "tracer"
 #   must_contain          substrings that MUST appear in tracer stderr
 #   must_not_contain      substrings that MUST NOT appear in tracer stderr
 #   must_contain_stdout   (optional) substrings that MUST appear in tracer stdout
-#                         — used by gap-demo cases where the attack succeeds and
-#                         the marker shows up on the tracee's stdout
 TESTS: list[dict] = [
     {
         "name": "01-stack-bof :: benign",
         "victim": "attacks/01-stack-bof/victim",
         "input_cmd": ["echo", "hello"],
         "expected_exit": 0,
-        "must_contain": [],
+        "must_contain": ["[attestation] cfg-hash = 0x"],
         "must_not_contain": ["[!!! ATTACK DETECTED]"],
     },
     {
@@ -59,7 +60,7 @@ TESTS: list[dict] = [
         "victim": "attacks/02-rop/victim",
         "input_cmd": ["echo", "hello"],
         "expected_exit": 0,
-        "must_contain": [],
+        "must_contain": ["[attestation] cfg-hash = 0x"],
         "must_not_contain": ["[!!! ATTACK DETECTED]"],
     },
     {
@@ -75,24 +76,46 @@ TESTS: list[dict] = [
         "victim": "attacks/03-jop/victim",
         "input_cmd": ["echo", "hello"],
         "expected_exit": 0,
-        "must_contain": [],
+        "must_contain": ["[attestation] cfg-hash = 0x"],
         "must_not_contain": ["[!!! ATTACK DETECTED]"],
     },
-    # NOTE: green = attack SUCCEEDED. This case documents the JOP gap in
-    # the iter-1 shadow stack — the detector cannot catch indirect-branch
-    # hijacks that terminate in _exit(). When iter-3b adds CFG-edge
-    # validation, flip expected_exit to 2 and replace must_contain_stdout
-    # with must_contain on stderr.
+    # The JOP chain hijacks `c.cb()` (a `blr Xn`) to a "gadget" function the
+    # program never calls or takes the address of, then `br x16` onward to
+    # win(). The CFG model's indirect-call check rejects the first hop: the
+    # pivot is not a legal call target. (Earlier iterations, shadow-stack
+    # only, could not see this — no `ret` is ever forged.)
     {
-        "name": "03-jop :: attack (gap demo)",
+        "name": "03-jop :: attack",
         "victim": "attacks/03-jop/victim",
         "input_cmd": ["python3", "attacks/03-jop/exploit.py"],
-        "expected_exit": 0,
-        "must_contain": [],
-        "must_contain_stdout": ["[!] PWNED via JOP chain"],
-        "must_not_contain": ["[!!! ATTACK DETECTED]"],
+        "expected_exit": 2,
+        "must_contain": ["[!!! ATTACK DETECTED]"],
+        "must_not_contain": ["[!] PWNED via JOP chain"],
     },
 ]
+
+
+def build_cfgs() -> bool:
+    """(Re)generate <victim>.cfg for every distinct victim in TESTS.
+
+    Echoes build_cfg.py's one-line summary per victim (function / BB / edge /
+    indirect-call-target counts) so a wrong CFG is obvious in the log.
+    """
+    ok = True
+    for v in sorted({c["victim"] for c in TESTS}):
+        if not (REPO_ROOT / v).exists():
+            print(f"[harness] CFG FAIL: victim {v} missing - run `make build` first")
+            return False
+        r = subprocess.run(
+            [sys.executable, str(BUILD_CFG), v],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        for line in (r.stdout + r.stderr).splitlines():
+            print(f"[harness] {line}")
+        if r.returncode != 0:
+            print(f"[harness] CFG FAIL: build_cfg.py {v} exited {r.returncode}")
+            ok = False
+    return ok
 
 
 def run_case(case: dict) -> tuple[bool, str, float, str]:
@@ -152,9 +175,17 @@ def main() -> int:
                     help="only run cases whose name contains this substring")
     args = ap.parse_args()
 
+    # We echo back tracer stderr verbatim (e.g. on -v); it contains non-ASCII
+    # (em-dashes), so don't let a C-locale stdout turn that into a crash.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+
     if not TRACER.exists():
         print(f"[harness] tracer not built at {TRACER} - run `make build` first",
               file=sys.stderr)
+        return 2
+
+    if not build_cfgs():
         return 2
 
     cases = [c for c in TESTS if args.filter in c["name"]]
