@@ -36,8 +36,10 @@ What attacks are we able to detect:
 - [x] Return-Oriented Programming — `attacks/02-rop/` (3-gadget chain, caught at the first hijacked `ret`)
 - [x] Jump-Oriented Programming — `attacks/03-jop/` (`blr`-pivot chain, caught at the pivot: not a legal call target)
 - [ ] Function reuse — whole-function gadgets reached via *legal* CFG edges (the L1 model accepts these)
-- [ ] Data-only attacks
-- [ ] Non-control-data overflows
+- [ ] Data-only attacks — `attacks/04-data-only/` is a PoC of the gap: a surgical 36-byte stack overflow flips an adjacent `is_admin` flag, so the legitimate `if (u.is_admin) admin_panel()` branch fires under attacker data. Every transfer is in the CFG and the shadow stack — L1 reports clean. Needs **L2** (data provenance) to flag that `is_admin`'s value came from untrusted bytes.
+- [ ] Non-control-data overflows — same `attacks/04-data-only/` PoC viewed from the other side. Alternative defence is **L3** (object bounds) — prevent the write past `name[32]` in the first place.
+
+The attestation hash printed by the detector *does* differ between the benign and 04-data-only runs (the sequence of legal edges taken is different); a C-FLAT-style verifier with a known-good baseline would catch the divergence. The current detector emits the hash but doesn't compare against a baseline, which is why 04-data-only is listed as an open gap rather than a caught attack.
 
 Next axes (not yet implemented): **L2** data-provenance tracking and **L3** object-bounds checking.
 
@@ -160,20 +162,31 @@ the matrix. Expected `make test` output:
 [harness] [build_cfg] 6 functions, 34 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
 [harness] [build_cfg] 8 functions, 38 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
 [harness] [build_cfg] 8 functions, 39 basic blocks, 16 edges, 3 indirect-call targets -> victim.cfg, victim.dot
+[harness] [build_cfg] 6 functions, 49 basic blocks, 34 edges, 3 indirect-call targets -> victim.cfg, victim.dot
 [ ok ] 01-stack-bof :: benign            (    12ms)  exit=0
 [ ok ] 01-stack-bof :: attack            (  1089ms)  exit=2
 [ ok ] 02-rop :: benign                  (    36ms)  exit=0
 [ ok ] 02-rop :: attack                  (  1084ms)  exit=2
 [ ok ] 03-jop :: benign                  (    12ms)  exit=0
 [ ok ] 03-jop :: attack                  (  1063ms)  exit=2
+[ ok ] 04-data-only :: benign            (    17ms)  exit=0
+[ ok ] 04-data-only :: attack            (   101ms)  exit=0
 
-6 passed, 0 failed
+8 passed, 0 failed
 ```
 Benign cases must exit `0` with an `[attestation] cfg-hash` line and no
-alert; attack cases must exit `2` with `[!!! ATTACK DETECTED]`.
+alert; attack cases that the L1 detector *catches* (01/02/03) must exit
+`2` with `[!!! ATTACK DETECTED]`. **04-data-only is the documented
+exception**: it is a non-control-data attack the L1 detector cannot
+catch, so its attack run is asserted to exit `0` with no alert and the
+`[ADMIN] secret` line in stdout (proving the exploit succeeded). The
+case is in the matrix so a future detector that closes the gap will
+surface the change as a test diff.
 
-(Attack runs are ~100× slower — single-stepping the victim to the
-hijack point.) Shell exit code is 0 on success, 1 if any case fails.
+(Attack runs that the detector catches are ~100× slower — single-stepping
+the victim to the hijack point. 04-data-only :: attack is fast because
+nothing is ever caught and the program runs straight through.) Shell
+exit code is 0 on success, 1 if any case fails.
 
 ### Adding a new attack to the test matrix
 
