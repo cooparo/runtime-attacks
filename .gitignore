@@ -23,7 +23,6 @@
 # Nix
 !*.nix
 !flake.lock
-!.envrc
 
 # Source code
 !*.c
