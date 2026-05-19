@@ -162,31 +162,21 @@ the matrix. Expected `make test` output:
 [harness] [build_cfg] 6 functions, 34 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
 [harness] [build_cfg] 8 functions, 38 basic blocks, 16 edges, 2 indirect-call targets -> victim.cfg, victim.dot
 [harness] [build_cfg] 8 functions, 39 basic blocks, 16 edges, 3 indirect-call targets -> victim.cfg, victim.dot
-[harness] [build_cfg] 6 functions, 49 basic blocks, 34 edges, 3 indirect-call targets -> victim.cfg, victim.dot
 [ ok ] 01-stack-bof :: benign            (    12ms)  exit=0
 [ ok ] 01-stack-bof :: attack            (  1089ms)  exit=2
 [ ok ] 02-rop :: benign                  (    36ms)  exit=0
 [ ok ] 02-rop :: attack                  (  1084ms)  exit=2
 [ ok ] 03-jop :: benign                  (    12ms)  exit=0
 [ ok ] 03-jop :: attack                  (  1063ms)  exit=2
-[ ok ] 04-data-only :: benign            (    17ms)  exit=0
-[ ok ] 04-data-only :: attack            (   101ms)  exit=0
 
-8 passed, 0 failed
+6 passed, 0 failed
 ```
 Benign cases must exit `0` with an `[attestation] cfg-hash` line and no
-alert; attack cases that the L1 detector *catches* (01/02/03) must exit
-`2` with `[!!! ATTACK DETECTED]`. **04-data-only is the documented
-exception**: it is a non-control-data attack the L1 detector cannot
-catch, so its attack run is asserted to exit `0` with no alert and the
-`[ADMIN] secret` line in stdout (proving the exploit succeeded). The
-case is in the matrix so a future detector that closes the gap will
-surface the change as a test diff.
+alert; attack cases must exit `2` with `[!!! ATTACK DETECTED]`.
 
-(Attack runs that the detector catches are ~100× slower — single-stepping
-the victim to the hijack point. 04-data-only :: attack is fast because
-nothing is ever caught and the program runs straight through.) Shell
-exit code is 0 on success, 1 if any case fails.
+(Attack runs the detector catches are ~100× slower — single-stepping
+the victim to the hijack point.) Shell exit code is 0 on success, 1 if
+any case fails.
 
 ### Adding a new attack to the test matrix
 

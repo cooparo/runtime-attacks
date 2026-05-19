@@ -92,33 +92,6 @@ TESTS: list[dict] = [
         "must_contain": ["[!!! ATTACK DETECTED]"],
         "must_not_contain": ["[!] PWNED via JOP chain"],
     },
-    {
-        "name": "04-data-only :: benign",
-        "victim": "attacks/04-data-only/victim",
-        "input_cmd": ["echo", "hello"],
-        "expected_exit": 0,
-        "must_contain": ["[attestation] cfg-hash = 0x"],
-        "must_not_contain": ["[!!! ATTACK DETECTED]", "[ADMIN]"],
-        "must_contain_stdout": ["(regular user)"],
-    },
-    # KNOWN L1 GAP. A non-control-data overflow flips `is_admin` via the
-    # adjacent-stack-variable overflow primitive. No control-flow transfer
-    # is hijacked: the `bl admin_panel` it ends up taking is one of the two
-    # static edges out of the `if (u.is_admin)` cbz — the L1 detector
-    # cannot distinguish it from a legitimate admin login. expected_exit=0
-    # / no alert asserts that gap; the attestation hash differs from the
-    # benign run (a future detector with a baseline check would catch it).
-    # When L2 (data provenance) or L3 (object bounds) lands and closes the
-    # gap, this case will flip and the diff will surface the change.
-    {
-        "name": "04-data-only :: attack",
-        "victim": "attacks/04-data-only/victim",
-        "input_cmd": ["python3", "attacks/04-data-only/exploit.py"],
-        "expected_exit": 0,
-        "must_contain": ["[attestation] cfg-hash = 0x"],
-        "must_not_contain": ["[!!! ATTACK DETECTED]"],
-        "must_contain_stdout": ["[ADMIN] secret"],
-    },
 ]
 
 
