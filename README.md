@@ -194,3 +194,43 @@ python3 tools/run_tests.py -v               # dump tracer stderr on every case
 python3 tools/run_tests.py -k 01-stack-bof  # only run cases matching substring
 ```
 
+## Evaluation harness
+
+`tools/run_tests.py` is the **correctness gate** (pass/fail, one run per case).
+`tools/run_eval.py` is the separate **measurement harness** that produces the
+numbers in the report: it repeats each case `N` times, writes per-run CSVs to
+`eval/raw/<date>/`, and renders a `eval/summary-<date>.md` with detection
+rate, false-positive rate, wall-clock overhead, and time-to-detection.
+
+```sh
+make build                                  # tracer + victims must exist first
+python3 tools/run_eval.py                    # N=30, date = today, out -> eval/
+python3 tools/run_eval.py --n 50 --measure-pwn-startup
+python3 tools/run_eval.py --attacks 01-stack-bof,02-rop   # subset
+```
+
+For each attack it measures four conditions — victim alone (no tracer, benign
+input), tracer+victim benign, and tracer+victim attack — and answers four
+research questions: **RQ-1** detection rate, **RQ-2** false-positive rate,
+**RQ-3** overhead ratio `wall(tracer+victim) / wall(victim alone)`, and
+**RQ-4** time-to-detection. Attack payloads are pre-generated once and reused
+across the N runs (the exploits are deterministic, no PIE), so pwntools
+startup is excluded from the timing; it is measured separately with
+`--measure-pwn-startup`.
+
+Latest run (`eval/summary-2026-05-19.md`, N=50, Raspberry Pi 4 / Cortex-A72,
+`ondemand` governor):
+
+| Attack | Detection | FPR | Overhead |
+|--------|-----------|-----|----------|
+| `01-stack-bof` | 100% (50/50) | 0% | 2.41x |
+| `02-rop`       | 100% (50/50) | 0% | 2.65x |
+| `03-jop`       | 100% (50/50) | 0% | 2.23x |
+| `04-data-only` | 0% (expected — L1 gap) | 0% | 3.13x |
+
+The `04-data-only` row is a documented gap, not a failure: a non-control-data
+overwrite that the L1 control-flow detector cannot observe (see the roadmap).
+Benign overhead is single-step ptrace on a short program (~2–3x wall clock,
+absolute cost ~10 ms); the attack runs the detector catches finish in well
+under 10 ms of tracer time.
+
