@@ -45,3 +45,7 @@ __pycache__/
 !/.github/
 !/.github/workflows/
 !/.github/workflows/*.yml
+
+# Evaluation outputs (raw CSVs + summary markdowns)
+!eval/
+!eval/**
